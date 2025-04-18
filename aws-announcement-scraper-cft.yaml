@@ -1,0 +1,795 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Announcements Scraper - Monthly automated generation of Excel files containing 
+  AWS announcements in Chinese and/or English
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket where Excel files will be stored
+    AllowedPattern: ^[a-z0-9][a-z0-9.-]*$
+    ConstraintDescription: Bucket name must contain only lowercase letters, numbers, dots, and hyphens, and cannot start with a dot or hyphen
+    
+  S3KeyPrefix:
+    Type: String
+    Description: (Optional) Prefix path for the Excel files in the S3 bucket
+    Default: "aws-announcements/"
+    
+  LanguagePreference:
+    Type: String
+    Description: Choose the language(s) for the Excel files
+    Default: both
+    AllowedValues:
+      - en
+      - cn
+      - both
+    
+  SNSTopicARN:
+    Type: String
+    Description: (Optional) ARN of the SNS topic for notifications
+    Default: ""
+    
+  CreateS3Bucket:
+    Type: String
+    Description: Create the S3 bucket if it doesn't exist
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
+Conditions:
+  HasSNSTopic: !Not [!Equals [!Ref SNSTopicARN, ""]]
+  IsAwsCnRegion: !Equals [!Sub "${AWS::Partition}", "aws-cn"]
+  IsCreateBucket: !Equals [!Ref CreateS3Bucket, "true"]
+
+Resources:
+  # S3 Bucket (if it doesn't exist)
+  AnnouncementsBucket:
+    Type: AWS::S3::Bucket
+    Condition: IsCreateBucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # IAM Role for Layer Builder Lambda
+  LayerBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${S3BucketName}/*"
+
+  # Lambda function to create and upload the layer
+  LayerBuilderLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LayerBuilderRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import tempfile
+          import subprocess
+          import shutil
+          import zipfile
+          import io
+          import json
+          import urllib.request
+          
+          # cfnresponse module needed for Custom Resource
+          # since this isn't available by default in Lambda environment
+          CFNRESPONSE_SUCCESS = "SUCCESS"
+          CFNRESPONSE_FAILED = "FAILED"
+          
+          def send(event, context, response_status, response_data, physical_resource_id=None, no_echo=False):
+              response_url = event['ResponseURL']
+              
+              response_body = {}
+              response_body['Status'] = response_status
+              response_body['Reason'] = 'See the details in CloudWatch Log Stream: ' + context.log_stream_name
+              response_body['PhysicalResourceId'] = physical_resource_id or context.log_stream_name
+              response_body['StackId'] = event['StackId']
+              response_body['RequestId'] = event['RequestId']
+              response_body['LogicalResourceId'] = event['LogicalResourceId']
+              response_body['NoEcho'] = no_echo
+              response_body['Data'] = response_data
+              
+              json_response_body = json.dumps(response_body)
+              
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(json_response_body))
+              }
+              
+              try:
+                  req = urllib.request.Request(url=response_url, data=json_response_body.encode('utf-8'), headers=headers, method='PUT')
+                  response = urllib.request.urlopen(req)
+                  print("Status code: " + str(response.getcode()))
+                  print("Status message: " + str(response.msg))
+                  return
+              except Exception as e:
+                  print("Error sending response: " + str(e))
+                  raise
+          
+          def handler(event, context):
+              # Initialize response properties
+              responseData = {}
+              
+              try:
+                  # Only process the request if it's a CREATE or UPDATE
+                  if event['RequestType'] in ['Create', 'Update']:
+                      s3_bucket = event['ResourceProperties']['S3Bucket']
+                      s3_prefix = event['ResourceProperties']['S3Prefix']
+                      
+                      # Ensure the prefix ends with a /
+                      if s3_prefix and not s3_prefix.endswith('/'):
+                          s3_prefix += '/'
+                      
+                      # Create layer package
+                      layer_path = create_layer_package()
+                      
+                      # Upload to S3
+                      s3_key = f"{s3_prefix}lambda-layer.zip"
+                      s3 = boto3.client('s3')
+                      s3.upload_file(layer_path, s3_bucket, s3_key)
+                      
+                      # Clean up temp file
+                      os.remove(layer_path)
+                      
+                      # Return the S3 key in the response
+                      responseData = {
+                          'S3Bucket': s3_bucket,
+                          'S3Key': s3_key
+                      }
+                      
+                      print(f"Successfully created and uploaded layer package to s3://{s3_bucket}/{s3_key}")
+                      
+                  # Send a success response to CloudFormation
+                  send(event, context, CFNRESPONSE_SUCCESS, responseData)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  send(event, context, CFNRESPONSE_FAILED, {"Error": str(e)})
+          
+          def create_layer_package():
+              print("Creating Lambda layer package...")
+              
+              # Create a temporary directory
+              temp_dir = tempfile.mkdtemp()
+              python_dir = os.path.join(temp_dir, 'python')
+              os.makedirs(python_dir)
+              
+              # Install required packages
+              print("Installing required packages...")
+              pip_cmd = f"pip install requests beautifulsoup4 pandas openpyxl -t {python_dir}"
+              result = subprocess.run(pip_cmd, shell=True, capture_output=True)
+              if result.returncode != 0:
+                  raise Exception(f"Failed to install dependencies: {result.stderr.decode()}")
+              
+              # Create a temporary zip file
+              print("Creating zip file...")
+              zip_path = os.path.join('/tmp', 'lambda-layer.zip')
+              
+              # Function to add files to the zip
+              def zipdir(path, zipf):
+                  for root, dirs, files in os.walk(path):
+                      for file in files:
+                          file_path = os.path.join(root, file)
+                          arcname = os.path.relpath(file_path, temp_dir)
+                          zipf.write(file_path, arcname)
+              
+              # Create the zip file
+              with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                  zipdir(temp_dir, zipf)
+              
+              # Clean up the temporary directory
+              shutil.rmtree(temp_dir)
+              
+              print(f"Layer package created at {zip_path}")
+              return zip_path
+
+  # Custom resource to trigger the layer builder
+  LayerBuilderCustomResource:
+    Type: Custom::LayerBuilder
+    Properties:
+      ServiceToken: !GetAtt LayerBuilderLambda.Arn
+      S3Bucket: !Ref S3BucketName
+      S3Prefix: !Ref S3KeyPrefix
+
+  # Lambda layer using the output from the builder
+  AnnouncementsScraperLambdaLayer:
+    Type: AWS::Lambda::LayerVersion
+    DependsOn: LayerBuilderCustomResource
+    Properties:
+      CompatibleRuntimes:
+        - python3.9
+      Content:
+        S3Bucket: !Ref S3BucketName
+        S3Key: !Sub "${S3KeyPrefix}lambda-layer.zip"
+      Description: Layer containing BeautifulSoup, pandas, and openpyxl dependencies
+      LayerName: aws-announcements-scraper-dependencies
+
+  # Main Lambda execution role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${S3BucketName}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${S3BucketName}/*"
+        - PolicyName: SNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: 
+                  - !If [HasSNSTopic, !Ref SNSTopicARN, !Ref "AWS::NoValue"]
+
+  # Main Lambda function for scraping AWS announcements
+  AnnouncementsScraperLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+          S3_PREFIX: !Ref S3KeyPrefix
+          LANGUAGE_PREFERENCE: !Ref LanguagePreference
+          SNS_TOPIC_ARN: !If [HasSNSTopic, !Ref SNSTopicARN, ""]
+      Code:
+        ZipFile: |
+          import requests
+          from bs4 import BeautifulSoup
+          import pandas as pd
+          from datetime import datetime, timedelta
+          import re
+          import time
+          import urllib.parse
+          import boto3
+          import os
+          import io
+          from openpyxl import load_workbook
+          from openpyxl.styles import Font
+          from openpyxl.styles.colors import Color
+
+          def get_aws_announcements(year, month=None, language='en'):
+              # Construct the URL with the user-provided year and language
+              base_url = "https://www.amazonaws.cn"
+              url = f"{base_url}/{language}/new/{year}/"
+              
+              # Set language-specific text patterns
+              if language == 'en':
+                  read_more_text = "Read More"
+                  posted_on_text = "Posted On:"
+                  launch_date_column = "Launch Date"
+                  launch_announcement_column = "Launch Announcement"
+              else:  # language == 'cn'
+                  read_more_text = "阅读更多"
+                  posted_on_text = "发布于:"
+                  launch_date_column = "发布日期"
+                  launch_announcement_column = "发布公告"
+              
+              try:
+                  # Send a GET request to the website
+                  response = requests.get(url)
+                  response.raise_for_status()  # Raise an exception for bad status codes
+                  
+                  # Parse the HTML content
+                  soup = BeautifulSoup(response.text, 'html.parser')
+                  
+                  # Initialize lists to store the data
+                  launch_dates = []
+                  titles = []
+                  urls = []  # Keep the URLs list for hyperlinks
+                  bjs_regions = []
+                  zhy_regions = []
+                  
+                  # Look for the pattern: ### Title + Posted On: Date
+                  # This is based on observation of the actual HTML structure
+                  headings = []
+                  
+                  # Find all headings that might be titles
+                  for heading in soup.find_all(['h1', 'h2', 'h3', 'h4']):
+                      headings.append(heading)
+                  
+                  for i, heading in enumerate(headings):
+                      heading_text = heading.get_text(strip=True)
+                      if not heading_text:
+                          continue
+                          
+                      # Look for the date in nearby text
+                      next_sibling = heading.next_sibling
+                      date_text = None
+                      
+                      # Try to find posted_on_text in the nearby text
+                      while next_sibling and not date_text:
+                          if isinstance(next_sibling, str) and posted_on_text in next_sibling:
+                              date_match = re.search(f"{re.escape(posted_on_text)} (.*?)$", next_sibling)
+                              if date_match:
+                                  date_text = date_match.group(1).strip()
+                              break
+                          next_sibling = next_sibling.next_sibling if hasattr(next_sibling, 'next_sibling') else None
+                      
+                      if not date_text:
+                          # If date not found, try an alternative approach
+                          parent = heading.parent
+                          if parent:
+                              parent_text = parent.get_text()
+                              date_match = re.search(f"{re.escape(posted_on_text)} (.*?)(?:\n|$)", parent_text)
+                              if date_match:
+                                  date_text = date_match.group(1).strip()
+                      
+                      if not date_text:
+                          # If date still not found, look in the following text
+                          all_text = soup.get_text()
+                          heading_pos = all_text.find(heading_text)
+                          if heading_pos != -1:
+                              following_text = all_text[heading_pos:heading_pos+500]  # Look in the next 500 chars
+                              date_match = re.search(f"{re.escape(posted_on_text)} (.*?)(?:\n|$)", following_text)
+                              if date_match:
+                                  date_text = date_match.group(1).strip()
+                      
+                      # Only proceed if we found a date
+                      if date_text:
+                          # Check if the date matches the specified month (if provided)
+                          if month:
+                              # Flag to track if this announcement should be included
+                              include_announcement = False
+                              
+                              try:
+                                  # IMPORTANT: For both English and Chinese pages, only use the %b %d, %Y format
+                                  # since AWS China uses this specific English date format even on Chinese pages
+                                  try:
+                                      # Parse with the single expected format: %b %d, %Y (e.g., "Feb 15, 2025")
+                                      date_obj = datetime.strptime(date_text.strip(), '%b %d, %Y')
+                                      if date_obj.month == month:
+                                          include_announcement = True
+                                  except ValueError:
+                                      # If English format failed and we're on Chinese page, try Chinese formats
+                                      if language == 'cn':
+                                          # Try to handle Chinese date formats, e.g., "4月13日, 2025" or "2025年4月13日"
+                                          
+                                          # Pattern 1: X月Y日, YYYY
+                                          date_parts = re.match(r'(\d+)月(\d+)日,\s*(\d{4})', date_text)
+                                          if date_parts:
+                                              month_num = int(date_parts.group(1))
+                                              if month_num == month:
+                                                  include_announcement = True
+                                          else:
+                                              # Pattern 2: YYYY年X月Y日
+                                              date_parts = re.match(r'(\d{4})年(\d+)月(\d+)日', date_text)
+                                              if date_parts:
+                                                  month_num = int(date_parts.group(2))
+                                                  if month_num == month:
+                                                      include_announcement = True
+                                              else:
+                                                  # Just look for X月 anywhere in the string
+                                                  month_match = re.search(r'(\d+)月', date_text)
+                                                  if month_match:
+                                                      month_num = int(month_match.group(1))
+                                                      if month_num == month:
+                                                          include_announcement = True
+                              
+                              except Exception as e:
+                                  # If all date parsing fails, include the announcement to be safe
+                                  include_announcement = True
+                              
+                              # Skip to the next announcement if this one doesn't match the month
+                              if not include_announcement:
+                                  continue
+                          
+                          # Remove year from date and format it according to language preference
+                          if language == 'en':
+                              # For English, keep the format "Month Day" (e.g., "February 15")
+                              date_parts = date_text.split(',')
+                              if len(date_parts) > 0:
+                                  date_without_year = date_parts[0].strip()
+                              else:
+                                  date_without_year = date_text
+                          else:  # Chinese
+                              # For Chinese output, try to convert to Chinese format "X月Y日"
+                              try:
+                                  # Try to parse with the expected English format
+                                  try:
+                                      date_obj = datetime.strptime(date_text.strip(), '%b %d, %Y')
+                                      # Convert to Chinese format "X月Y日"
+                                      date_without_year = f"{date_obj.month}月{date_obj.day}日"
+                                  except ValueError:
+                                      # If can't parse as English, try to extract from Chinese format
+                                      date_match = re.search(r'(\d+月\d+日)', date_text)
+                                      if date_match:
+                                          date_without_year = date_match.group(1)
+                                      else:
+                                          date_without_year = date_text.split(',')[0] if ',' in date_text else date_text
+                              except Exception as e:
+                                  # Fallback to original text if conversion fails
+                                  date_without_year = date_text
+                          
+                          # Get the surrounding text for region check
+                          surrounding_text = ""
+                          if heading.parent:
+                              surrounding_text = heading.parent.get_text()
+                          else:
+                              surrounding_text = heading.get_text()
+                          
+                          # Look for "Read More" link to get more complete information
+                          read_more_link = None
+                          read_more_found = False
+                          
+                          # First check in the parent element
+                          if heading.parent:
+                              # Try different ways to find the Read More link
+                              # Method 1: Direct find with string pattern
+                              link = heading.parent.find('a', string=re.compile(read_more_text, re.IGNORECASE))
+                              
+                              # Method 2: Find any anchor with "Read More" text
+                              if not link:
+                                  for a_tag in heading.parent.find_all('a'):
+                                      if a_tag.get_text() and read_more_text.lower() in a_tag.get_text().lower():
+                                          link = a_tag
+                                          read_more_found = True
+                                          break
+                              else:
+                                  read_more_found = True
+                                  
+                              # Method 3: Find anchor tags near the heading
+                              if not read_more_found:
+                                  # Look at siblings
+                                  sibling = heading.next_sibling
+                                  while sibling and not read_more_found:
+                                      if hasattr(sibling, 'name') and sibling.name == 'a':
+                                          link = sibling
+                                          read_more_found = True
+                                          break
+                                      sibling = sibling.next_sibling if hasattr(sibling, 'next_sibling') else None
+                              
+                              # If found, get the link
+                              if read_more_found and link and 'href' in link.attrs:
+                                  read_more_link = link['href']
+                                  
+                                  # If the link is relative, make it absolute (fix URL construction)
+                                  if read_more_link.startswith('/'):
+                                      read_more_link = urllib.parse.urljoin(base_url, read_more_link)
+                          
+                          # If no read more link is found, use the current year page as fallback
+                          if not read_more_link:
+                              read_more_link = url
+                          
+                          # Initialize region flags
+                          bjs_region = ''
+                          zhy_region = ''
+                          
+                          # Check for region mentions in the current content based on language
+                          lower_surrounding = surrounding_text.lower()
+                          
+                          if language == 'en':
+                              if 'beijing' in lower_surrounding or 'bjs' in lower_surrounding:
+                                  bjs_region = 'GA'
+                              if 'ningxia' in lower_surrounding or 'zhy' in lower_surrounding:
+                                  zhy_region = 'GA'
+                          else:  # Chinese
+                              if '北京' in surrounding_text:
+                                  bjs_region = 'GA'
+                              if '宁夏' in surrounding_text:
+                                  zhy_region = 'GA'
+                          
+                          # Try to get more detailed content if "Read More" link is available
+                          if read_more_link:
+                              try:
+                                  print(f"Checking details for: {heading_text[:50]}...")
+                                  
+                                  # Some retry logic in case of network issues
+                                  max_retries = 3
+                                  for retry in range(max_retries):
+                                      try:
+                                          detail_response = requests.get(read_more_link, timeout=15)
+                                          detail_response.raise_for_status()
+                                          break
+                                      except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+                                          if retry < max_retries - 1:
+                                              time.sleep(2)
+                                          else:
+                                              raise
+                                  
+                                  if detail_response.status_code == 200:
+                                      detail_soup = BeautifulSoup(detail_response.text, 'html.parser')
+                                      detail_text = detail_soup.get_text()
+                                      
+                                      # Update region check with more detailed content
+                                      lower_detail = detail_text.lower()
+                                      
+                                      if language == 'en':
+                                          if 'beijing' in lower_detail or ' bjs ' in lower_detail:
+                                              bjs_region = 'GA'
+                                          if 'ningxia' in lower_detail or ' zhy ' in lower_detail:
+                                              zhy_region = 'GA'
+                                      else:  # Chinese
+                                          if '北京' in detail_text:
+                                              bjs_region = 'GA'
+                                          if '宁夏' in detail_text:
+                                              zhy_region = 'GA'
+                              except Exception as e:
+                                  print(f"Warning: Could not fetch detail page {read_more_link}, {str(e)}")
+                          
+                          # Append the data to the lists
+                          launch_dates.append(date_without_year)
+                          titles.append(heading_text)
+                          urls.append(read_more_link)
+                          bjs_regions.append(bjs_region)
+                          zhy_regions.append(zhy_region)
+                  
+                  # Create a DataFrame from the data
+                  if language == 'en':
+                      df = pd.DataFrame({
+                          "Launch Date": launch_dates,
+                          "Launch Announcement": titles,
+                          "Beijing Region": bjs_regions,
+                          "Ningxia Region": zhy_regions,
+                          # Remove URL column from DataFrame
+                          # "URL": urls
+                      })
+                  else:  # Chinese
+                      df = pd.DataFrame({
+                          "发布日期": launch_dates,
+                          "发布公告": titles,
+                          "北京区域": bjs_regions,
+                          "宁夏区域": zhy_regions,
+                          # Remove URL column from DataFrame
+                          # "URL": urls
+                      })
+                  
+                  # Store URLs separately for use in hyperlinks
+                  df.attrs['urls'] = urls
+                  
+                  return df
+              except Exception as e:
+                  print(f"An error occurred: {e}")
+                  import traceback
+                  traceback.print_exc()
+                  return None
+
+          def lambda_handler(event, context):
+              # Initialize S3 client
+              s3 = boto3.client('s3')
+              
+              # Get parameters from environment variables
+              s3_bucket = os.environ.get('S3_BUCKET')
+              s3_prefix = os.environ.get('S3_PREFIX', '')
+              language_preference = os.environ.get('LANGUAGE_PREFERENCE', 'both')
+              sns_topic_arn = os.environ.get('SNS_TOPIC_ARN', '')
+              
+              # Calculate previous month
+              today = datetime.today()
+              first_day_of_month = datetime(today.year, today.month, 1)
+              last_month = first_day_of_month - timedelta(days=1)
+              
+              year = last_month.year
+              month = last_month.month
+              
+              # Prepare S3 path structure
+              if s3_prefix:
+                  if not s3_prefix.endswith('/'):
+                      s3_prefix += '/'
+              
+              s3_path = f"{s3_prefix}{year}/{month:02d}/"
+              
+              # Initialize success flag for SNS notification
+              success = True
+              files_generated = []
+              error_message = ""
+              
+              # Process Chinese data if required
+              if language_preference in ['cn', 'both']:
+                  try:
+                      cn_df = get_aws_announcements(year, month, 'cn')
+                      if cn_df is not None and not cn_df.empty:
+                          # Get URLs from DataFrame attributes
+                          urls = cn_df.attrs.get('urls', [])
+                          
+                          # Create Excel file in memory
+                          excel_buffer = io.BytesIO()
+                          cn_df.to_excel(excel_buffer, index=False, engine='openpyxl')
+                          excel_buffer.seek(0)
+                          
+                          # Add hyperlinks to the Excel file
+                          workbook = load_workbook(excel_buffer)
+                          sheet = workbook.active
+                          
+                          # Find the Launch Announcement column index
+                          announcement_col = None
+                          for col in range(1, sheet.max_column + 1):
+                              cell_value = sheet.cell(row=1, column=col).value
+                              if cell_value == "发布公告":
+                                  announcement_col = col
+                                  break
+                          
+                          # Add hyperlinks if column found and URLs available
+                          if announcement_col and urls:
+                              blue_font = Font(color="0000FF", underline="single")
+                              for row in range(2, min(len(urls) + 2, sheet.max_row + 1)):
+                                  url_idx = row - 2
+                                  if url_idx < len(urls):
+                                      cell = sheet.cell(row=row, column=announcement_col)
+                                      cell.hyperlink = urls[url_idx]
+                                      cell.font = blue_font
+                          
+                          # Save the modified workbook
+                          output_buffer = io.BytesIO()
+                          workbook.save(output_buffer)
+                          output_buffer.seek(0)
+                          
+                          # Upload to S3
+                          cn_filename = f"aws_announcements_{year}_{month:02d}_cn.xlsx"
+                          s3_key = s3_path + cn_filename
+                          s3.upload_fileobj(output_buffer, s3_bucket, s3_key)
+                          files_generated.append(s3_key)
+                  except Exception as e:
+                      success = False
+                      error_message += f"Error processing Chinese data: {str(e)}\n"
+              
+              # Process English data if required
+              if language_preference in ['en', 'both']:
+                  try:
+                      en_df = get_aws_announcements(year, month, 'en')
+                      if en_df is not None and not en_df.empty:
+                          # Get URLs from DataFrame attributes
+                          urls = en_df.attrs.get('urls', [])
+                          
+                          # Create Excel file in memory
+                          excel_buffer = io.BytesIO()
+                          en_df.to_excel(excel_buffer, index=False, engine='openpyxl')
+                          excel_buffer.seek(0)
+                          
+                          # Add hyperlinks to the Excel file
+                          workbook = load_workbook(excel_buffer)
+                          sheet = workbook.active
+                          
+                          # Find the Launch Announcement column index
+                          announcement_col = None
+                          for col in range(1, sheet.max_column + 1):
+                              cell_value = sheet.cell(row=1, column=col).value
+                              if cell_value == "Launch Announcement":
+                                  announcement_col = col
+                                  break
+                          
+                          # Add hyperlinks if column found and URLs available
+                          if announcement_col and urls:
+                              blue_font = Font(color="0000FF", underline="single")
+                              for row in range(2, min(len(urls) + 2, sheet.max_row + 1)):
+                                  url_idx = row - 2
+                                  if url_idx < len(urls):
+                                      cell = sheet.cell(row=row, column=announcement_col)
+                                      cell.hyperlink = urls[url_idx]
+                                      cell.font = blue_font
+                          
+                          # Save the modified workbook
+                          output_buffer = io.BytesIO()
+                          workbook.save(output_buffer)
+                          output_buffer.seek(0)
+                          
+                          # Upload to S3
+                          en_filename = f"aws_announcements_{year}_{month:02d}_en.xlsx"
+                          s3_key = s3_path + en_filename
+                          s3.upload_fileobj(output_buffer, s3_bucket, s3_key)
+                          files_generated.append(s3_key)
+                  except Exception as e:
+                      success = False
+                      error_message += f"Error processing English data: {str(e)}\n"
+              
+              # Send SNS notification if topic ARN is provided
+              if sns_topic_arn:
+                  sns = boto3.client('sns')
+                  
+                  if success:
+                      message = f"AWS Announcements scraping completed successfully for {year}-{month:02d}.\n"
+                      message += "Files generated:\n"
+                      for file in files_generated:
+                          message += f"- s3://{s3_bucket}/{file}\n"
+                  else:
+                      message = f"AWS Announcements scraping encountered errors for {year}-{month:02d}.\n"
+                      message += error_message
+                      if files_generated:
+                          message += "Some files were still generated:\n"
+                          for file in files_generated:
+                              message += f"- s3://{s3_bucket}/{file}\n"
+                  
+                  subject = f"AWS Announcements Scraping {'Success' if success else 'Failed'} - {year}-{month:02d}"
+                  sns.publish(
+                      TopicArn=sns_topic_arn,
+                      Subject=subject,
+                      Message=message
+                  )
+              
+              return {
+                  'statusCode': 200 if success else 500,
+                  'body': {
+                      'success': success,
+                      'files_generated': files_generated,
+                      'error_message': error_message if not success else ''
+                  }
+              }
+      Layers:
+        - !Ref AnnouncementsScraperLambdaLayer
+
+  # Monthly schedule to trigger the Lambda function
+  MonthlyScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger the AWS Announcements Scraper on the 1st day of each month
+      ScheduleExpression: cron(0 0 1 * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AnnouncementsScraperLambda.Arn
+          Id: AnnouncementsScraperLambdaTarget
+
+  # Permission for EventBridge to invoke the Lambda function
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AnnouncementsScraperLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyScheduleRule.Arn
+
+Outputs:
+  LambdaFunction:
+    Description: Lambda function that scrapes AWS announcements
+    Value: !Ref AnnouncementsScraperLambda
+  
+  MonthlySchedule:
+    Description: CloudWatch Events rule for monthly execution
+    Value: !Ref MonthlyScheduleRule
+  
+  S3BucketPath:
+    Description: S3 bucket and prefix where Excel files will be stored
+    Value: !Sub s3://${S3BucketName}/${S3KeyPrefix} 
