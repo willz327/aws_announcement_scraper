@@ -40,8 +40,6 @@ aws-announcement-scraper/
 ├── README.md                                    # English documentation
 ├── examples/                                    # Example files
 │   └── sample-output.xlsx                       # Sample output file
-└── docs/                                        # Detailed documentation
-    └── architecture.png                         # Architecture diagram
 ```
 
 ## Deployment Instructions
