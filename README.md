@@ -1,4 +1,4 @@
-# AWS Announcements Scraper
+# AWS Announcement Scraper
 
 Automated tool to collect AWS official announcements in Chinese and English and generate Excel files. This tool runs once a month, scrapes all AWS announcements published in the previous month, and stores them in Excel format in an S3 bucket.
 
@@ -35,8 +35,8 @@ Automated tool to collect AWS official announcements in Chinese and English and 
 ## File Structure
 
 ```
-aws-announcements-scraper/
-├── aws-announcements-scraper-cft-enhanced.yaml  # CloudFormation template
+aws-announcement-scraper/
+├── aws-announcement-scraper-cft.yaml  # CloudFormation template
 ├── README.md                                    # English documentation
 ├── README_CN.md                                 # Chinese documentation
 ├── examples/                                    # Example files
@@ -58,7 +58,7 @@ aws-announcements-scraper/
 
 2. Click "Create Stack" > "With new resources".
 
-3. Select "Upload a template file" and upload the `aws-announcements-scraper-cft-enhanced.yaml` file.
+3. Select "Upload a template file" and upload the `aws-announcement-scraper-cft-enhanced.yaml` file.
 
 4. Fill in the stack name and parameters:
    - **S3BucketName**: Name of the S3 bucket where Excel files will be stored.
@@ -73,13 +73,13 @@ aws-announcements-scraper/
 
 ```bash
 aws cloudformation create-stack \
-  --stack-name AWSAnnouncementsScraper \
-  --template-body file://aws-announcements-scraper-cft-enhanced.yaml \
+  --stack-name AWSAnnouncementScraper \
+  --template-body file://aws-announcement-scraper-cft-enhanced.yaml \
   --parameters \
     ParameterKey=S3BucketName,ParameterValue=your-bucket-name \
     ParameterKey=S3KeyPrefix,ParameterValue=aws-announcements/ \
     ParameterKey=LanguagePreference,ParameterValue=both \
-    ParameterKey=SNSTopicARN,ParameterValue=arn:aws:sns:region:account-id:topic-name \
+    ParameterKey=SNSTopicARN,ParameterValue=arn:aws-cn:sns:region:account-id:topic-name \
     ParameterKey=CreateS3Bucket,ParameterValue=true \
   --capabilities CAPABILITY_IAM
 ```
