@@ -38,7 +38,6 @@ Automated tool to collect AWS official announcements in Chinese and English and 
 aws-announcement-scraper/
 ├── aws-announcement-scraper-cft.yaml  # CloudFormation template
 ├── README.md                                    # English documentation
-├── README_CN.md                                 # Chinese documentation
 ├── examples/                                    # Example files
 │   └── sample-output.xlsx                       # Sample output file
 └── docs/                                        # Detailed documentation
