@@ -262,14 +262,16 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3:::${S3BucketName}"
                   - !Sub "arn:${AWS::Partition}:s3:::${S3BucketName}/*"
-        - PolicyName: SNSAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: sns:Publish
-                Resource: 
-                  - !If [HasSNSTopic, !Ref SNSTopicARN, !Ref "AWS::NoValue"]
+        - !If
+          - HasSNSTopic
+          - PolicyName: SNSAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: sns:Publish
+                  Resource: !Ref SNSTopicARN
+          - !Ref "AWS::NoValue"
 
   # Main Lambda function for scraping AWS announcements
   AnnouncementsScraperLambda:
